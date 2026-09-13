@@ -1,0 +1,162 @@
+name: Windows Desktop (PC-Free)
+
+# Two ways to use this workflow:
+#  1. Automatic validation on every push/PR - lints the compose config,
+#     no container is started, safe to run on any branch.
+#  2. Manual deploy ("Run workflow" button) - actually starts the Windows
+#     container on the runner and exposes port 8006 through a temporary
+#     Cloudflare tunnel so you get a URL to open the desktop in your browser.
+#
+# Required repo secrets for the deploy job:
+#   WINDOWS_USERNAME  - username for the Windows account
+#   WINDOWS_PASSWORD  - password for the Windows account
+#
+# Note: GitHub-hosted "ubuntu-latest" runners support nested virtualization
+# (KVM), which this container needs. Each manual run gets a fresh VM and a
+# hard 6-hour job time limit, so treat this as disposable/ephemeral, not a
+# permanent desktop.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ram_size:
+        description: "RAM to allocate to Windows (e.g. 6G, 10G)"
+        required: false
+        default: "6G"
+      cpu_cores:
+        description: "CPU cores to allocate to Windows"
+        required: false
+        default: "2"
+      windows_version:
+        description: "Windows version"
+        required: false
+        default: "10"
+        type: choice
+        options:
+          - "10"
+          - "11"
+
+jobs:
+  validate:
+    name: Validate compose config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Write compose file for validation
+        run: |
+          cat > windows10.yml <<'EOF'
+          services:
+            windows:
+              image: dockurr/windows
+              container_name: windows
+              environment:
+                VERSION: "10"
+                USERNAME: placeholder
+                PASSWORD: placeholder
+                RAM_SIZE: "6G"
+                CPU_CORES: "2"
+              cap_add:
+                - NET_ADMIN
+              ports:
+                - "8006:8006"
+                - "3389:3389/tcp"
+              volumes:
+                - windows-data:/mnt/windows-data
+              devices:
+                - "/dev/kvm:/dev/kvm"
+                - "/dev/net/tun:/dev/net/tun"
+              stop_grace_period: 2m
+              restart: always
+          volumes:
+            windows-data:
+          EOF
+
+      - name: docker compose config (syntax check only)
+        run: docker compose -f windows10.yml config
+
+  deploy:
+    name: Deploy Windows desktop (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Confirm KVM is available
+        run: |
+          ls -la /dev/kvm
+          docker --version
+
+      - name: Write compose file
+        env:
+          WINDOWS_USERNAME: ${{ secrets.WINDOWS_USERNAME }}
+          WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
+        run: |
+          cat > windows10.yml <<EOF
+          services:
+            windows:
+              image: dockurr/windows
+              container_name: windows
+              environment:
+                VERSION: "${{ github.event.inputs.windows_version }}"
+                USERNAME: ${WINDOWS_USERNAME}
+                PASSWORD: ${WINDOWS_PASSWORD}
+                RAM_SIZE: "${{ github.event.inputs.ram_size }}"
+                CPU_CORES: "${{ github.event.inputs.cpu_cores }}"
+              cap_add:
+                - NET_ADMIN
+              ports:
+                - "8006:8006"
+                - "3389:3389/tcp"
+              volumes:
+                - windows-data:/mnt/windows-data
+              devices:
+                - "/dev/kvm:/dev/kvm"
+                - "/dev/net/tun:/dev/net/tun"
+              stop_grace_period: 2m
+              restart: always
+          volumes:
+            windows-data:
+          EOF
+
+      - name: Start Windows container
+        run: docker compose -f windows10.yml up -d
+
+      - name: Wait for Windows web UI to respond
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8006 > /dev/null; then
+              echo "Web UI is up."
+              break
+            fi
+            echo "Waiting for port 8006... ($i/60)"
+            sleep 10
+          done
+
+      - name: Install cloudflared
+        run: |
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+
+      - name: Expose port 8006 via temporary tunnel
+        run: |
+          ./cloudflared tunnel --url http://localhost:8006 > tunnel.log 2>&1 &
+          sleep 10
+          echo "### 🖥️ Windows Desktop URL" >> "$GITHUB_STEP_SUMMARY"
+          grep -o 'https://.*trycloudflare.com' tunnel.log | head -n1 >> "$GITHUB_STEP_SUMMARY" || echo "Tunnel URL not found yet, check the logs." >> "$GITHUB_STEP_SUMMARY"
+          cat tunnel.log
+
+      - name: Keep runner alive while you use the desktop
+        run: |
+          echo "Container is running. This job will keep going until it hits the timeout or you cancel it manually from the Actions tab."
+          sleep 18000
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f windows10.yml down
